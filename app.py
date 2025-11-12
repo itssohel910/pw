@@ -181,7 +181,8 @@ async def on_ready():
         await bot.tree.sync()
     print("Context menus synced successfully!")
 
-bot.run(os.environ.get("dt"))
+bot.run(os.environ.get("DISCORD_TOKEN"))
+
 
 
 
