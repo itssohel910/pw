@@ -1,192 +1,109 @@
 import discord
 from discord.ext import commands
+from discord import app_commands
 from PIL import Image
-import imagehash
-import aiohttp
-import io, json, os, re
+import torch
+import clip
+from torchvision import transforms
+import io, aiohttp, os, asyncio
+# from dotenv import load_dotenv
 
-# ---------------- CONFIG ---------------- #
+# 🔐 Load token from .env
+# load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
 
-HASH_DB_FILE = "hash_db.json"
-GUILD_ID = None
-os.makedirs("hash_db", exist_ok=True)
+# 🧠 Load CLIP model for image comparison
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model, preprocess = clip.load("ViT-B/32", device=device)
 
-# ---------------- LOAD DB ---------------- #
-if os.path.exists(HASH_DB_FILE):
-    with open(HASH_DB_FILE, "r", encoding="utf-8") as f:
-        hash_db = json.load(f)
-else:
-    hash_db = {}
+# 📂 Preload all Pokémon images and encode once
+pokemon_dir = "pokemon"
+pokemon_features = []
+pokemon_names = []
 
-# Temporary store for unnamed hashes
-temp_hashes = []
+for fname in os.listdir(pokemon_dir):
+    if fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+        name = os.path.splitext(fname)[0]
+        image = preprocess(Image.open(os.path.join(pokemon_dir, fname)).convert("RGB")).unsqueeze(0).to(device)
+        with torch.no_grad():
+            feature = model.encode_image(image)
+            feature /= feature.norm(dim=-1, keepdim=True)
+        pokemon_features.append(feature)
+        pokemon_names.append(name)
 
-# ---------------- HELPERS ---------------- #
-def normalise_name(raw: str) -> str:
-    if not raw:
-        return "unknown"
-    s = raw.strip()
-    s = re.sub(r'^[\'"“”‘’]+|[\'"“”‘’]+$', '', s)
-    s = re.sub(r'[\.\,\!\?\:\;]+$', '', s)
-    s = s.replace(' ', '_')
-    return s
-def real_name(raw: str) -> str:
-    if not raw:
-        return "unknown"
-    s = raw.strip()
-    s = re.sub(r'^[\'"“”‘’]+|[\'"“”‘’]+$', '', s)
-    s = re.sub(r'[\.\,\!\?\:\;]+$', '', s)
-    s = s.replace('_', ' ')
-    return s
+pokemon_features = torch.cat(pokemon_features, dim=0)
 
-def identify(img: Image.Image):
-    ph = imagehash.phash(img)
-    best_name, best_dist = None, 999
-    for name, h in hash_db.items():
-        d = ph - imagehash.hex_to_hash(h)
-        if d < best_dist:
-            best_name, best_dist = name, d
-    return best_name, best_dist
-
-def extract_pokemon_name_from_text(text: str):
-    if not text:
-        return None
-    patterns = [
-        re.compile(r'Wild\s+(.+?)\s+fled', re.IGNORECASE),
-        re.compile(r'A wild\s+(.+?)\s+has fled', re.IGNORECASE),
-        re.compile(r'The wild\s+(.+?)\s+fled', re.IGNORECASE)
-    ]
-    for pat in patterns:
-        m = pat.search(text)
-        if m:
-            return normalise_name(m.group(1))
-    return None
-
-# ---------------- BOT SETUP ---------------- #
+# ⚙️ Bot setup
 intents = discord.Intents.default()
-intents.messages = True
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=None, intents=intents)
 
 @bot.event
 async def on_ready():
     bot.session = aiohttp.ClientSession()
-    print(f"Logged in as {bot.user}")
-
-    # ---------- Identify Pokémon (context menu) ----------
-    @bot.tree.context_menu(name="Identify Pokémon")
-    async def identify_command(interaction: discord.Interaction, message: discord.Message):
-        image_url = None
-        if message.attachments:
-            att = message.attachments[0]
-            if att.content_type and att.content_type.startswith("image"):
-                image_url = att.url
-        elif message.embeds:
-            embed = message.embeds[0]
-            if embed.image and embed.image.url:
-                image_url = embed.image.url
-
-        if not image_url:
-            await interaction.response.send_message("❌ No image found!", ephemeral=True)
-            return
-
-        async with bot.session.get(image_url) as resp:
-            if resp.status != 200:
-                await interaction.response.send_message("⚠️ Failed to fetch image!", ephemeral=True)
-                return
-            data = await resp.read()
-
-        try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
-        except Exception as e:
-            await interaction.response.send_message(f"Error reading image: {e}", ephemeral=True)
-            return
-
-        name, dist = identify(img)
-        if name:
-            name = real_name(name)
-            await interaction.response.send_message(f"@Pokétwo#8236 c {name.lower()}", ephemeral=True)
-        else:
-            await interaction.response.send_message("❓ Could not identify the Pokémon.", ephemeral=True)
-
-    # ---------- Store Pokémon Image Hash ----------
-    @bot.tree.context_menu(name="Store Pokémon Image Hash")
-    async def store_image_hash(interaction: discord.Interaction, message: discord.Message):
-        image_url = None
-        if message.attachments:
-            att = message.attachments[0]
-            if att.content_type and att.content_type.startswith("image"):
-                image_url = att.url
-        elif message.embeds:
-            embed = message.embeds[0]
-            if embed.image and embed.image.url:
-                image_url = embed.image.url
-
-        if not image_url:
-            await interaction.response.send_message("❌ No image found!", ephemeral=True)
-            return
-
-        async with bot.session.get(image_url) as resp:
-            if resp.status != 200:
-                await interaction.response.send_message("⚠️ Failed to fetch image!", ephemeral=True)
-                return
-            data = await resp.read()
-
-        try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
-            ph = str(imagehash.phash(img))
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error reading image: {e}", ephemeral=True)
-            return
-
-        temp_hashes.append(ph)
-        await interaction.response.send_message(f"⏳ Image hash stored temporarily ({len(temp_hashes)} stored)", ephemeral=True)
-
-    # ---------- Assign Pokémon Name to Last Hash ----------
-    @bot.tree.context_menu(name="Assign Pokémon Name to Last Hash")
-    async def assign_name(interaction: discord.Interaction, message: discord.Message):
-        if not temp_hashes:
-            await interaction.response.send_message("⚠️ No stored image hashes to assign!", ephemeral=True)
-            return
-
-        poke_name = extract_pokemon_name_from_text(message.content)
-
-        if not poke_name and message.embeds:
-            for embed in message.embeds:
-                if getattr(embed, "title", None):
-                    poke_name = extract_pokemon_name_from_text(embed.title)
-                if poke_name:
-                    break
-                if getattr(embed, "description", None):
-                    poke_name = extract_pokemon_name_from_text(embed.description)
-                if poke_name:
-                    break
-
-        if not poke_name:
-            await interaction.response.send_message("❌ Could not find Pokémon name in this message!", ephemeral=True)
-            return
-
-        ph = temp_hashes.pop(0)
-        hash_db[poke_name] = ph
-
-        with open(HASH_DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(hash_db, f, indent=2, ensure_ascii=False)
-
-        await interaction.response.send_message(f"✅ Assigned name '{poke_name}' to stored hash", ephemeral=True)
-
-    # ---------- Sync context menus ----------
-    if GUILD_ID:
-        await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-    else:
+    try:
         await bot.tree.sync()
-    print("Context menus synced successfully!")
+        print(" Commands synced")
+    except Exception as e:
+        print("Sync error:", e)
+    print(f" Logged in as {bot.user}")
 
-bot.run(os.environ.get("DISCORD_TOKEN"))
+@bot.tree.context_menu(name="Identify Pokémon")
+async def identify_pokemon(interaction: discord.Interaction, message: discord.Message):
+    """Right-click an image message and select 'Identify Pokémon'."""
+    image_url = None
 
+    # attachments
+    if message.attachments:
+        att = message.attachments[0]
+        if att.content_type and att.content_type.startswith("image"):
+            image_url = att.url
 
+    # embeds (Pokétwo)
+    if not image_url and message.embeds:
+        embed = message.embeds[0]
+        if embed.image and embed.image.url:
+            image_url = embed.image.url
 
+    if not image_url:
+        await interaction.response.send_message("❌ No image found!", ephemeral=True)
+        return
 
+    async with bot.session.get(image_url) as resp:
+        if resp.status != 200:
+            await interaction.response.send_message("⚠️ Could not download image!", ephemeral=True)
+            return
+        data = await resp.read()
 
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        input_tensor = preprocess(img).unsqueeze(0).to(device)
+        with torch.no_grad():
+            input_feature = model.encode_image(input_tensor)
+            input_feature /= input_feature.norm(dim=-1, keepdim=True)
 
+        # cosine similarity
+        similarities = (input_feature @ pokemon_features.T).squeeze(0)
+        best_idx = similarities.argmax().item()
+        best_score = similarities[best_idx].item()
+        best_name = pokemon_names[best_idx]
 
+        if best_score > 0.85:
+            await interaction.response.send_message(
+                f"🧠 I’m {best_score*100:.1f}% sure this is **{best_name.title()}**!",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                "❓ I couldn’t confidently identify this Pokémon.",
+                ephemeral=True
+            )
+
+    except Exception as e:
+        await interaction.response.send_message(f"Error: {e}", ephemeral=True)
+
+@bot.event
+async def on_close():
+    await bot.session.close()
+
+bot.run(TOKEN)
 
